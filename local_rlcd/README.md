@@ -137,6 +137,27 @@ That is about 9–10 GB before activations, which leaves room for text and moder
 
 Memory does not depend on `--states-per-step`, because each question is backpropagated before the next one is run. Check `peak_gpu_gb` in the logs.
 
+### Pure BF16 training (`--precision bf16`)
+
+The default `--precision mixed` matches Valen's own setup: FP32 weights with BF16 autocast. `--precision bf16` stores the backbone weights, gradients and AdamW moments in BF16, as most large full-SFT setups do:
+
+| Item | mixed + `adamw8bit` | `bf16` + `adamw_bf16` |
+| --- | --- | --- |
+| Weights | ~3.4 GB FP32 | ~1.7 GB BF16 |
+| Gradients | ~3.4 GB FP32 | ~1.7 GB BF16 |
+| Optimizer states | ~1.7 GB 8-bit | ~3.4 GB BF16 |
+| Total before reference and activations | ~8.5 GB | ~6.8 GB |
+
+```bash
+python local_rlcd/training.py --mode sft --precision bf16 --init output/local/head_warmup/latest \
+  --data data/train.jsonl --eval-data data/eval.jsonl --output output/local/sft_bf16
+```
+
+- **Optimizer:** BF16 mode selects its own optimizer, `--optim adamw_bf16`, and refuses any other. At full-SFT learning rates (1e-5 to 1e-6), each step changes a weight by about 1e-5 of its value. That is smaller than BF16's spacing (about 4e-3 relative), so ordinary rounding drops every update. `adamw_bf16` computes each update in FP32, then writes it back with *stochastic rounding*. Rounding is unbiased, so small updates still add up correctly over many steps.
+- **Head:** the decision head stays in FP32, because it is tiny and benefits most from full precision.
+- **Checkpoints:** saved in BF16 (half the size). Resume a BF16 run with `--precision bf16`. To switch precision, start a new run with `--init`.
+- **Trade-off:** gradients are summed in BF16 across the questions of a step, which adds some noise. If quality matters more than about 2 GB of memory, keep `mixed`. `bf16` is the better choice when memory is tight, for example with RLCD plus video.
+
 ## Outputs
 
 ```text
@@ -168,6 +189,7 @@ The response format is the same as Valen's. `choice` returns `probabilities`, `c
 These checks ran on CPU, using a tiny random Qwen3.5 with the real architecture (DeltaNet + full attention, vision tower) and the real Qwen3.5 tokenizer and processor:
 
 - SFT, RLCD from `--init`, RLCD `--resume`, eval, `best/` / `latest/` saving, and both inference modes all completed on `data/smoke/train.jsonl` (text, image and video records).
+- `--precision bf16`: SFT, resume, RLCD from `--init` and inference all completed. Saved checkpoints hold BF16 backbone and FP32 head tensors, and the precision-mismatch and optimizer guards refuse bad combinations. With FP32 tensors, `adamw_bf16` matches `torch.optim.AdamW` to 2e-7. Its stochastic rounding is unbiased: 1000 updates of +1e-4 to a BF16 weight of 1.0 reach 1.099, while ordinary rounding stays at 1.0.
 - The compiler's input tensors, candidate and decision positions, and role spans are identical to Valen's compiler for all 69 smoke branches, including shuffled choice orders.
 
 Not yet verified: training on a real RTX 5070 Ti with Qwen3.5-0.8B weights, the real memory peak, throughput, and model quality. Run a short job first, for example `--max-steps 5`, and check `peak_gpu_gb`.
