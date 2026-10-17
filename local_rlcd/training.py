@@ -352,12 +352,12 @@ class ValenModel(nn.Module):
         return torch.cat(logits)
 
 
-def load_backbone(model_path, attn_implementation="eager"):
+def load_backbone(model_path, attn_implementation="eager", dtype=torch.float32):
     from transformers import Qwen3_5ForConditionalGeneration
     # Load the published container and keep only its backbone. Loading Qwen3_5Model
     # directly can silently re-initialize the language tower in Transformers 5.4.
     container, info = Qwen3_5ForConditionalGeneration.from_pretrained(
-        model_path, dtype=torch.float32, attn_implementation=attn_implementation, output_loading_info=True)
+        model_path, dtype=dtype, attn_implementation=attn_implementation, output_loading_info=True)
     problems = {key: [k for k in info.get(key, []) if not k.startswith("lm_head")]
                 for key in ("missing_keys", "unexpected_keys", "mismatched_keys")}
     if any(problems.values()) or info.get("error_msgs"):
@@ -396,8 +396,9 @@ def load_weights(model, path):
     model.load_state_dict(converted, strict=True)
 
 
-def build_model(base_model, head_config, device, attn="eager", gradient_checkpointing=True):
-    backbone = load_backbone(base_model, attn)
+def build_model(base_model, head_config, device, attn="eager", gradient_checkpointing=True,
+                backbone_dtype=torch.float32):
+    backbone = load_backbone(base_model, attn, backbone_dtype)
     head = build_head(backbone.config.text_config.hidden_size, head_config)
     model = ValenModel(backbone, head.float())
     if gradient_checkpointing:
@@ -412,11 +413,10 @@ def load_for_inference(checkpoint, device="cuda", base_model=None, attn="eager")
     checkpoint = Path(checkpoint)
     config = json.loads((checkpoint / CONFIG_FILE).read_text(encoding="utf-8"))
     processor = AutoProcessor.from_pretrained(checkpoint)
-    model = build_model(base_model or config["base_model"], config["head"], "cpu", attn, gradient_checkpointing=False)
+    dtype = torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32
+    model = build_model(base_model or config["base_model"], config["head"], "cpu", attn,
+                        gradient_checkpointing=False, backbone_dtype=dtype)
     load_weights(model, checkpoint / WEIGHTS_FILE)
-    if torch.device(device).type == "cuda":
-        model.backbone.to(torch.bfloat16)
-    model.head.float()
     model.to(device).eval()
     return model, processor, config
 
@@ -575,6 +575,60 @@ def configure_trainable(model, args):
         model.backbone.gradient_checkpointing_disable()
 
 
+def stochastic_round_(target, source):
+    """Write FP32 `source` into BF16 `target`, rounding up with probability equal to the
+    discarded fraction. Round-to-nearest would drop the ~1e-5 relative updates of full
+    fine-tuning, which are smaller than BF16's ~4e-3 relative spacing."""
+    bits = source.view(torch.int32)
+    noise = torch.randint_like(bits, 0, 1 << 16)
+    target.copy_(((bits + noise) & -65536).view(torch.float32))  # Exact: low 16 bits are zero.
+
+
+class BF16AdamW(torch.optim.Optimizer):
+    """AdamW whose moments share each parameter's dtype. BF16 weights are updated in FP32
+    and written back with stochastic rounding; FP32 parameters (the head) update normally."""
+
+    def __init__(self, params, lr=1e-5, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0, chunk_size=1 << 24):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+        self.chunk_size = chunk_size  # Bounds FP32 temporaries for the 248k-token embedding table.
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            lr, eps, decay = group["lr"], group["eps"], group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if not state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.contiguous_format)
+                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.contiguous_format)
+                state["step"] += 1
+                bias1, bias2 = 1 - beta1 ** state["step"], 1 - beta2 ** state["step"]
+                flat = [t.view(-1) for t in (p.data, p.grad.contiguous(), state["exp_avg"], state["exp_avg_sq"])]
+                for start in range(0, flat[0].numel(), self.chunk_size):
+                    w_, g_, m_, v_ = (t[start:start + self.chunk_size] for t in flat)
+                    # For FP32 tensors .float() aliases the storage, so only the moment and
+                    # weight tensors themselves are updated in place.
+                    g = g_.float()
+                    m = m_.float().mul_(beta1).add_(g, alpha=1 - beta1)
+                    v = v_.float().mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                    m_.copy_(m)
+                    v_.copy_(v)
+                    w = w_.float()
+                    if decay:
+                        w.mul_(1 - lr * decay)
+                    w.addcdiv_(m, (v / bias2).sqrt_().add_(eps), value=-lr / bias1)
+                    if w_.dtype == torch.bfloat16:
+                        stochastic_round_(w_, w)
+                    else:
+                        w_.copy_(w)
+        return loss
+
+
 def make_optimizer(model, args):
     rates = {"head": args.lr_head, "merger": args.lr_merger, "vision": args.lr_vision, "language": args.lr_backbone}
     groups = {}
@@ -594,6 +648,8 @@ def make_optimizer(model, args):
         except ImportError:
             sys.exit("bitsandbytes is not installed: `pip install bitsandbytes` or pass --optim adafactor")
         return bnb.optim.AdamW8bit(params, betas=(0.9, 0.95), eps=1e-8)
+    if args.optim == "adamw_bf16":
+        return BF16AdamW(params, betas=(0.9, 0.95), eps=1e-8)
     if args.optim == "adafactor":
         return torch.optim.Adafactor(params)
     return torch.optim.AdamW(params, betas=(0.9, 0.95), eps=1e-8, fused=model.device.type == "cuda")
@@ -629,7 +685,8 @@ def make_reference(model, device, path):
 
 def save_checkpoint(directory, model, optimizer, processor, args, progress):
     directory.mkdir(parents=True, exist_ok=True)
-    save_weights(model, directory / WEIGHTS_FILE, torch.bfloat16 if args.save_bf16 else torch.float32)
+    bf16 = args.save_bf16 or args.precision == "bf16"  # BF16 weights are saved exactly.
+    save_weights(model, directory / WEIGHTS_FILE, torch.bfloat16 if bf16 else torch.float32)
     config = {"model": MODEL_NAME, "base_model": args.base_model, "head": args.head,
               "max_length": args.max_length, "media_kwargs": args.media_kwargs,
               "mode": args.mode, "progress": progress, "args": vars(args)}
@@ -662,7 +719,11 @@ def parse_args(argv=None):
     p.add_argument("--schedule", choices=("constant", "cosine"), default="cosine")
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
     # Optimizer
-    p.add_argument("--optim", choices=("adamw8bit", "adafactor", "adamw"), default="adamw8bit")
+    p.add_argument("--precision", choices=("mixed", "bf16"), default="mixed",
+                   help="mixed: FP32 weights + BF16 autocast (Valen). bf16: BF16 backbone weights, "
+                        "gradients and moments with stochastic-rounding updates; the head stays FP32")
+    p.add_argument("--optim", choices=("adamw8bit", "adamw_bf16", "adafactor", "adamw"),
+                   help="Default: adamw8bit (mixed), adamw_bf16 (bf16)")
     p.add_argument("--lr-backbone", type=float, help="Default: 1e-5 (sft), 1e-6 (rlcd)")
     p.add_argument("--lr-vision", type=float, help="Vision encoder. Default: 2e-6 (sft), 2e-7 (rlcd)")
     p.add_argument("--lr-merger", type=float, help="Vision adaptor (visual.merger). Default: 1e-5 (sft), 1e-6 (rlcd)")
@@ -710,6 +771,10 @@ def parse_args(argv=None):
     args.lr_head = args.lr_head if args.lr_head is not None else (2e-4 if sft else 1e-5)
     if args.freeze_merger and args.train_merger:
         p.error("--freeze-merger and --train-merger are contradictory")
+    if args.optim is None:
+        args.optim = "adamw_bf16" if args.precision == "bf16" else "adamw8bit"
+    if args.precision == "bf16" and args.optim != "adamw_bf16":
+        p.error("--precision bf16 needs --optim adamw_bf16; other optimizers round BF16 updates to zero")
     if args.init and args.resume:
         p.error("--init starts a new run and --resume continues one; choose one")
     if args.group_size < 2 or args.num_iterations < 1 or not 0 < args.clip_epsilon < 1:
@@ -744,9 +809,14 @@ def main(argv=None):
             print(f"Using checkpoint base model {saved['base_model']!r}", flush=True)
             args.base_model = saved["base_model"]
         args.head = saved["head"]
+        saved_precision = saved.get("args", {}).get("precision", "mixed")
+        if args.resume and saved_precision != args.precision:
+            sys.exit(f"Checkpoint was trained with --precision {saved_precision}; resume with the same "
+                     "value, or start a new run with --init")
 
     processor = AutoProcessor.from_pretrained(args.base_model)
-    model = build_model(args.base_model, args.head, "cpu", args.attn, not args.no_gradient_checkpointing)
+    model = build_model(args.base_model, args.head, "cpu", args.attn, not args.no_gradient_checkpointing,
+                        torch.bfloat16 if args.precision == "bf16" else torch.float32)
     if source is not None:
         load_weights(model, source / WEIGHTS_FILE)
         print(f"Loaded weights from {source}", flush=True)
@@ -755,7 +825,7 @@ def main(argv=None):
 
     reference = None
     if args.mode == "rlcd" and args.beta > 0:
-        # Copied on CPU to avoid a second FP32 model on the GPU. Resumed runs reuse
+        # Copied on CPU to avoid a second model on the GPU. Resumed runs reuse
         # the saved original reference, not the current weights.
         reference = make_reference(model, args.reference_device or args.device, output / REFERENCE_FILE)
     model.to(args.device)
@@ -779,7 +849,7 @@ def main(argv=None):
     compiler = Compiler(processor, Path(args.data).parent, args.max_length, args.media_kwargs)
     eval_compiler = (Compiler(processor, Path(args.eval_data).parent, args.max_length, args.media_kwargs)
                      if args.eval_data else None)
-    print(f"{len(records)} labeled training records; mode={args.mode}; optimizer={args.optim}", flush=True)
+    print(f"{len(records)} labeled training records; mode={args.mode}; precision={args.precision}; optimizer={args.optim}", flush=True)
 
     def epoch_order(epoch):
         order = list(range(len(records)))
