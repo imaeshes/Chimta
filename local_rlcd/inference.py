@@ -58,7 +58,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", required=True, help="Directory written by training.py (latest/ or best/)")
     p.add_argument("--base-model", help="Override the base model path recorded in the checkpoint")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--data", help="Valen JSONL; targets are optional")
     p.add_argument("--output", help="Prediction JSONL (default: stdout)")
@@ -71,6 +71,8 @@ def main():
     args = p.parse_args()
     if args.temperature <= 0:
         p.error("--temperature must be positive")
+    if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
+        sys.exit("CUDA is not available to this PyTorch build; see README (RTX 50xx needs CUDA 12.8 wheels)")
 
     model, processor, config = load_for_inference(args.checkpoint, args.device, args.base_model)
     if args.data:

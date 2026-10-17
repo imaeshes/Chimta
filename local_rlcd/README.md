@@ -35,9 +35,7 @@ The 5070 Ti is compute capability sm_120 and needs **PyTorch ≥ 2.7 built for C
 
 ```bash
 python -m venv .venv && source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install "transformers==5.4.0" safetensors accelerate "av==16.1.0" pillow numpy
-pip install bitsandbytes                                   # 8-bit AdamW (default optimizer)
+pip install -r local_rlcd/requirements.txt                # pinned; pulls torch 2.9.1+cu128
 python -c "import torch; print(torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))"
 ```
 
@@ -75,7 +73,7 @@ python local_rlcd/training.py --mode sft --freeze-backbone \
   --base-model models/Qwen3.5-0.8B --data data/train.jsonl --eval-data data/eval.jsonl \
   --output output/local/sft_head --max-steps 300 --lr-head 2e-4
 
-# 2. Full SFT from the warm head.
+# 2. Full SFT from the warm head (default: --device cuda --precision bf16).
 python local_rlcd/training.py --mode sft --init output/local/sft_head/latest \
   --data data/train.jsonl --eval-data data/eval.jsonl \
   --output output/local/sft_full --max-steps 2000 --epochs 3

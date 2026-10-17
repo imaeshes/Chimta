@@ -352,12 +352,16 @@ class ValenModel(nn.Module):
         return torch.cat(logits)
 
 
-def load_backbone(model_path, attn_implementation="eager", dtype=torch.float32):
+def load_backbone(model_path, attn_implementation="eager", dtype=torch.float32, device="cpu"):
     from transformers import Qwen3_5ForConditionalGeneration
     # Load the published container and keep only its backbone. Loading Qwen3_5Model
     # directly can silently re-initialize the language tower in Transformers 5.4.
-    container, info = Qwen3_5ForConditionalGeneration.from_pretrained(
-        model_path, dtype=dtype, attn_implementation=attn_implementation, output_loading_info=True)
+    device = torch.device(device)
+    kwargs = dict(dtype=dtype, attn_implementation=attn_implementation,
+                  output_loading_info=True, low_cpu_mem_usage=True)
+    if device.type == "cuda":
+        kwargs["device_map"] = {"": device.index if device.index is not None else 0}
+    container, info = Qwen3_5ForConditionalGeneration.from_pretrained(model_path, **kwargs)
     problems = {key: [k for k in info.get(key, []) if not k.startswith("lm_head")]
                 for key in ("missing_keys", "unexpected_keys", "mismatched_keys")}
     if any(problems.values()) or info.get("error_msgs"):
@@ -398,7 +402,7 @@ def load_weights(model, path):
 
 def build_model(base_model, head_config, device, attn="eager", gradient_checkpointing=True,
                 backbone_dtype=torch.float32):
-    backbone = load_backbone(base_model, attn, backbone_dtype)
+    backbone = load_backbone(base_model, attn, backbone_dtype, device)
     head = build_head(backbone.config.text_config.hidden_size, head_config)
     model = ValenModel(backbone, head.float())
     if gradient_checkpointing:
@@ -413,12 +417,13 @@ def load_for_inference(checkpoint, device="cuda", base_model=None, attn="eager")
     checkpoint = Path(checkpoint)
     config = json.loads((checkpoint / CONFIG_FILE).read_text(encoding="utf-8"))
     processor = AutoProcessor.from_pretrained(checkpoint)
-    dtype = torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32
-    model = build_model(base_model or config["base_model"], config["head"], "cpu", attn,
+    target = torch.device(device)
+    dtype = torch.bfloat16 if target.type == "cuda" else torch.float32
+    model = build_model(base_model or config["base_model"], config["head"], target, attn,
                         gradient_checkpointing=False, backbone_dtype=dtype)
     load_weights(model, checkpoint / WEIGHTS_FILE)
-    model.to(device).eval()
-    return model, processor, config
+    model.head.float()
+    return model.eval(), processor, config
 
 
 def answer(question, logits, temperature=1.0):
@@ -719,9 +724,9 @@ def parse_args(argv=None):
     p.add_argument("--schedule", choices=("constant", "cosine"), default="cosine")
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
     # Optimizer
-    p.add_argument("--precision", choices=("mixed", "bf16"), default="mixed",
-                   help="mixed: FP32 weights + BF16 autocast (Valen). bf16: BF16 backbone weights, "
-                        "gradients and moments with stochastic-rounding updates; the head stays FP32")
+    p.add_argument("--precision", choices=("mixed", "bf16"), default="bf16",
+                   help="bf16: load and train the backbone in BF16 on CUDA (default). "
+                        "mixed: FP32 weights + BF16 autocast (Valen's own setup). Head stays FP32")
     p.add_argument("--optim", choices=("adamw8bit", "adamw_bf16", "adafactor", "adamw"),
                    help="Default: adamw8bit (mixed), adamw_bf16 (bf16)")
     p.add_argument("--lr-backbone", type=float, help="Default: 1e-5 (sft), 1e-6 (rlcd)")
@@ -795,12 +800,16 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=True)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if torch.device(args.device).type == "cuda":
+    device = torch.device(args.device)
+    if device.type == "cuda":
         if not torch.cuda.is_available():
             sys.exit("CUDA is not available to this PyTorch build; see README (RTX 50xx needs CUDA 12.8 wheels)")
+        torch.cuda.set_device(device)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.cuda.reset_peak_memory_stats()
+        print(f"CUDA: {torch.cuda.get_device_name(device)}  capability={torch.cuda.get_device_capability(device)}  "
+              f"bf16={torch.cuda.is_bf16_supported()}", flush=True)
 
     source = Path(args.resume or args.init) if (args.resume or args.init) else None
     if source is not None:
@@ -815,8 +824,10 @@ def main(argv=None):
                      "value, or start a new run with --init")
 
     processor = AutoProcessor.from_pretrained(args.base_model)
-    model = build_model(args.base_model, args.head, "cpu", args.attn, not args.no_gradient_checkpointing,
-                        torch.bfloat16 if args.precision == "bf16" else torch.float32)
+    backbone_dtype = torch.bfloat16 if args.precision == "bf16" else torch.float32
+    model = build_model(args.base_model, args.head, device, args.attn, not args.no_gradient_checkpointing,
+                        backbone_dtype)
+    model.head.float()
     if source is not None:
         load_weights(model, source / WEIGHTS_FILE)
         print(f"Loaded weights from {source}", flush=True)
@@ -825,10 +836,8 @@ def main(argv=None):
 
     reference = None
     if args.mode == "rlcd" and args.beta > 0:
-        # Copied on CPU to avoid a second model on the GPU. Resumed runs reuse
-        # the saved original reference, not the current weights.
+        # Frozen starting policy. Resumed runs reuse the saved original reference.
         reference = make_reference(model, args.reference_device or args.device, output / REFERENCE_FILE)
-    model.to(args.device)
     configure_trainable(model, args)
     model.train()
 
@@ -849,7 +858,8 @@ def main(argv=None):
     compiler = Compiler(processor, Path(args.data).parent, args.max_length, args.media_kwargs)
     eval_compiler = (Compiler(processor, Path(args.eval_data).parent, args.max_length, args.media_kwargs)
                      if args.eval_data else None)
-    print(f"{len(records)} labeled training records; mode={args.mode}; precision={args.precision}; optimizer={args.optim}", flush=True)
+    print(f"{len(records)} labeled training records; mode={args.mode}; precision={args.precision}; "
+          f"optimizer={args.optim}; device={device}", flush=True)
 
     def epoch_order(epoch):
         order = list(range(len(records)))
