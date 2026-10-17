@@ -556,25 +556,33 @@ def configure_trainable(model, args):
     model.requires_grad_(True)
     if args.freeze_backbone:
         model.backbone.requires_grad_(False)
-    if args.freeze_vision and hasattr(model.backbone, "visual"):
-        model.backbone.visual.requires_grad_(False)
+    visual = getattr(model.backbone, "visual", None)
+    if visual is not None:
+        if args.freeze_vision:
+            visual.requires_grad_(False)
+        if args.freeze_merger:
+            visual.merger.requires_grad_(False)
+        elif args.train_merger:
+            # Valen "joint": frozen vision encoder, trainable vision-language adaptor.
+            visual.merger.requires_grad_(True)
     if args.freeze_embeddings:
         model.backbone.get_input_embeddings().requires_grad_(False)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Trainable parameters: {trainable:,} / {total:,} ({100 * trainable / total:.1f}%)", flush=True)
-    if args.freeze_backbone:
+    if not any(p.requires_grad for p in model.backbone.parameters()):
         # No backbone gradients: checkpointing would only add recomputation.
         model.backbone.gradient_checkpointing_disable()
 
 
 def make_optimizer(model, args):
-    rates = {"head": args.lr_head, "vision": args.lr_vision, "language": args.lr_backbone}
+    rates = {"head": args.lr_head, "merger": args.lr_merger, "vision": args.lr_vision, "language": args.lr_backbone}
     groups = {}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        part = "head" if name.startswith("head.") else "vision" if ".visual." in name else "language"
+        part = ("head" if name.startswith("head.") else "merger" if ".visual.merger." in name
+                else "vision" if ".visual." in name else "language")
         decay = parameter.ndim >= 2 and "embed" not in name and "norm" not in name
         groups.setdefault((part, decay), []).append(parameter)
     params = [{"params": ps, "lr": rates[part], "base_lr": rates[part],
@@ -656,13 +664,18 @@ def parse_args(argv=None):
     # Optimizer
     p.add_argument("--optim", choices=("adamw8bit", "adafactor", "adamw"), default="adamw8bit")
     p.add_argument("--lr-backbone", type=float, help="Default: 1e-5 (sft), 1e-6 (rlcd)")
-    p.add_argument("--lr-vision", type=float, help="Default: 2e-6 (sft), 2e-7 (rlcd)")
+    p.add_argument("--lr-vision", type=float, help="Vision encoder. Default: 2e-6 (sft), 2e-7 (rlcd)")
+    p.add_argument("--lr-merger", type=float, help="Vision adaptor (visual.merger). Default: 1e-5 (sft), 1e-6 (rlcd)")
     p.add_argument("--lr-head", type=float, help="Default: 2e-4 (sft), 1e-5 (rlcd)")
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     # What trains
     p.add_argument("--freeze-backbone", action="store_true", help="Head-only warmup")
-    p.add_argument("--freeze-vision", action="store_true", help="Keep the vision tower frozen")
+    p.add_argument("--freeze-vision", action="store_true",
+                   help="Freeze the whole vision tower, including the adaptor unless --train-merger")
+    p.add_argument("--freeze-merger", action="store_true", help="Freeze only the vision adaptor (visual.merger)")
+    p.add_argument("--train-merger", action="store_true",
+                   help="With --freeze-vision or --freeze-backbone, keep the vision adaptor trainable")
     p.add_argument("--freeze-embeddings", action="store_true", help="Keep token embeddings frozen")
     p.add_argument("--no-gradient-checkpointing", action="store_true")
     p.add_argument("--attn", default="eager", help="attn_implementation passed to Transformers")
@@ -693,7 +706,10 @@ def parse_args(argv=None):
     sft = args.mode == "sft"
     args.lr_backbone = args.lr_backbone if args.lr_backbone is not None else (1e-5 if sft else 1e-6)
     args.lr_vision = args.lr_vision if args.lr_vision is not None else (2e-6 if sft else 2e-7)
+    args.lr_merger = args.lr_merger if args.lr_merger is not None else (1e-5 if sft else 1e-6)
     args.lr_head = args.lr_head if args.lr_head is not None else (2e-4 if sft else 1e-5)
+    if args.freeze_merger and args.train_merger:
+        p.error("--freeze-merger and --train-merger are contradictory")
     if args.init and args.resume:
         p.error("--init starts a new run and --resume continues one; choose one")
     if args.group_size < 2 or args.num_iterations < 1 or not 0 < args.clip_epsilon < 1:

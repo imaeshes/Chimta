@@ -92,12 +92,26 @@ python local_rlcd/training.py --mode rlcd --resume output/local/rlcd_full/latest
 
 When `--init` or `--resume` is set, the base model and head architecture are read from the checkpoint. Valen's own experiments split the data, for example 70k SFT and 30k RLCD records out of 100k.
 
-Default learning rates (override with `--lr-backbone`, `--lr-vision`, `--lr-head`):
+Default learning rates (override with `--lr-backbone`, `--lr-vision`, `--lr-merger`, `--lr-head`):
 
-| | backbone (language) | vision tower | head |
-| --- | --- | --- | --- |
-| SFT | 1e-5 | 2e-6 | 2e-4 |
-| RLCD | 1e-6 | 2e-7 | 1e-5 |
+| | backbone (language) | vision encoder | vision adaptor (`visual.merger`) | head |
+| --- | --- | --- | --- | --- |
+| SFT | 1e-5 | 2e-6 | 1e-5 | 2e-4 |
+| RLCD | 1e-6 | 2e-7 | 1e-6 | 1e-5 |
+
+### Vision adaptor
+
+The vision adaptor is Qwen3.5's `visual.merger`, the patch merger that projects vision-encoder features into the language model. It trains by default with its own learning rate. These flags control it:
+
+| Goal | Flags |
+| --- | --- |
+| Everything trainable (default) | none |
+| Freeze only the adaptor | `--freeze-merger` |
+| Freeze the vision tower **and** the adaptor | `--freeze-vision` |
+| Frozen vision encoder, trainable adaptor (Valen `joint` without LoRA) | `--freeze-vision --train-merger` |
+| Head + adaptor only (frozen language and vision encoder) | `--freeze-backbone --train-merger` |
+
+The `Trainable parameters` line printed at startup shows what is actually unfrozen.
 
 Schedule: linear warmup (`--warmup-steps 20`), then cosine to 10% (`--schedule constant` keeps Valen's constant rate). One step is `--states-per-step` records, with gradients accumulated per question. Valen's weighting applies: mean over questions within a record, then over records.
 
