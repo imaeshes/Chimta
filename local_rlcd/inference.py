@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from training import (MODEL_NAME, Compiler, answer, hard_correct, load_for_inference,  # noqa: E402
-                      read_jsonl, sft_loss)
+                      read_jsonl, resolve_dataset, sft_loss)
 
 
 def single_record(args):
@@ -60,7 +60,7 @@ def main():
     p.add_argument("--base-model", help="Override the base model path recorded in the checkpoint")
     p.add_argument("--device", default="cuda")
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--data", help="Valen JSONL; targets are optional")
+    p.add_argument("--data", help="Valen JSONL, Hub id, or alias (valen/eval/smoke); targets optional")
     p.add_argument("--output", help="Prediction JSONL (default: stdout)")
     p.add_argument("--text")
     p.add_argument("--image", action="append", default=[])
@@ -76,6 +76,7 @@ def main():
 
     model, processor, config = load_for_inference(args.checkpoint, args.device, args.base_model)
     if args.data:
+        args.data = str(resolve_dataset(args.data))
         records, root = read_jsonl(args.data), Path(args.data).parent
     else:
         records, root = [single_record(args)], Path(".")

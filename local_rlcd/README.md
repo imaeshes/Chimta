@@ -53,7 +53,18 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
 
 ## Data
 
-Use Valen JSONL. One record per line with `request.state`, `request.questions` (`choice`, `noul` or `score`) and `targets`. Media paths are relative to the JSONL file. Only labeled questions are trained. Records longer than `--max-length` tokens are skipped with a message, never truncated. Keep the train and eval files split by `group_id`.
+The pipeline defaults to Valen's released General sets and downloads them on first run into `data/hf/` (JSONL plus `assets.zip`, which is unpacked so image URLs resolve):
+
+| alias | Hub id | used as |
+| --- | --- | --- |
+| `valen` / `train` (default `--data`) | [Valen-Training-General-100k](https://huggingface.co/datasets/Valen-Team/Valen-Training-General-100k) | SFT / RLCD |
+| `eval` (default `--eval-data`) | [Valen-Eval-General-5k](https://huggingface.co/datasets/Valen-Team/Valen-Eval-General-5k) | held-out eval |
+| `game` | [Valen-Eval-Game](https://huggingface.co/datasets/Valen-Team/Valen-Eval-Game) | Sokoban |
+| `smoke` | `data/smoke/train.jsonl` | local pipeline check |
+
+On the official 100k file, `--data-slice auto` (default) follows Valen's split: **first 70k for `--mode sft`, last 30k for `--mode rlcd`**. Pass `--data-slice all` to use every record. `--eval-data none` skips eval.
+
+You can still pass a local JSONL. Media paths are relative to that file. Only labeled questions are trained. Records longer than `--max-length` tokens are skipped, never truncated.
 
 ```json
 {"group_id": "light-1", "request": {"state": {"messages": [{"role": "user", "content": [
@@ -69,23 +80,25 @@ Run from the repository root. Each stage writes to its own output directory.
 
 ```bash
 # 1. Head warmup: backbone frozen, head learns to read Qwen features (fast).
+#    Downloads General-100k + Eval-5k on first run (default --data / --eval-data).
 python local_rlcd/training.py --mode sft --freeze-backbone \
-  --base-model models/Qwen3.5-0.8B --data data/train.jsonl --eval-data data/eval.jsonl \
+  --base-model models/Qwen3.5-0.8B \
   --output output/local/sft_head --max-steps 300 --lr-head 2e-4
 
 # 2. Full SFT from the warm head (default: --device cuda --precision bf16).
 python local_rlcd/training.py --mode sft --init output/local/sft_head/latest \
-  --data data/train.jsonl --eval-data data/eval.jsonl \
   --output output/local/sft_full --max-steps 2000 --epochs 3
 
 # 3. Full RLCD from the SFT checkpoint (best/ = highest eval accuracy).
 python local_rlcd/training.py --mode rlcd --init output/local/sft_full/best \
-  --data data/rl.jsonl --eval-data data/eval.jsonl \
   --output output/local/rlcd_full --max-steps 1000
 
 # Continue an interrupted run (same flags, weights + optimizer + data cursor restored):
 python local_rlcd/training.py --mode rlcd --resume output/local/rlcd_full/latest \
-  --data data/rl.jsonl --output output/local/rlcd_full --max-steps 1000
+  --output output/local/rlcd_full --max-steps 1000
+
+# Local smoke instead of the 100k download:
+python local_rlcd/training.py --mode sft --data smoke --eval-data none --output output/local/smoke
 ```
 
 When `--init` or `--resume` is set, the base model and head architecture are read from the checkpoint. Valen's own experiments split the data, for example 70k SFT and 30k RLCD records out of 100k.
@@ -148,7 +161,7 @@ The default `--precision mixed` matches Valen's own setup: FP32 weights with BF1
 
 ```bash
 python local_rlcd/training.py --mode sft --precision bf16 --init output/local/head_warmup/latest \
-  --data data/train.jsonl --eval-data data/eval.jsonl --output output/local/sft_bf16
+  --output output/local/sft_bf16
 ```
 
 - **Optimizer:** BF16 mode selects its own optimizer, `--optim adamw_bf16`, and refuses any other. At full-SFT learning rates (1e-5 to 1e-6), each step changes a weight by about 1e-5 of its value. That is smaller than BF16's spacing (about 4e-3 relative), so ordinary rounding drops every update. `adamw_bf16` computes each update in FP32, then writes it back with *stochastic rounding*. Rounding is unbiased, so small updates still add up correctly over many steps.

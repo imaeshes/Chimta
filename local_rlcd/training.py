@@ -23,6 +23,7 @@ from pathlib import Path
 import random
 import sys
 import time
+import zipfile
 
 if os.name != "nt":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -35,6 +36,22 @@ CONFIG_FILE = "valen_local.json"
 WEIGHTS_FILE = "model.safetensors"
 STATE_FILE = "trainer_state.pt"
 REFERENCE_FILE = "reference.safetensors"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_CACHE = REPO_ROOT / "data" / "hf"
+
+# Official Valen JSONL + images (docs/technical.md). Media URLs are relative to train.jsonl.
+VALEN_TRAIN_HUB = "Valen-Team/Valen-Training-General-100k"
+VALEN_EVAL_HUB = "Valen-Team/Valen-Eval-General-5k"
+VALEN_GAME_HUB = "Valen-Team/Valen-Eval-Game"
+VALEN_SFT_COUNT = 70_000  # first 70k SFT, remaining 30k RLCD on the official 100k file
+DATA_ALIASES = {
+    "valen": VALEN_TRAIN_HUB,
+    "general": VALEN_TRAIN_HUB,
+    "train": VALEN_TRAIN_HUB,
+    "eval": VALEN_EVAL_HUB,
+    "game": VALEN_GAME_HUB,
+    "smoke": str(REPO_ROOT / "data" / "smoke" / "train.jsonl"),
+}
 
 # Matches the released Valen checkpoints (config.json -> valen_media_kwargs).
 DEFAULT_MEDIA_KWARGS = {
@@ -55,7 +72,7 @@ def candidates(question):
     criteria = question.get("criteria")
     if kind == "noul":
         # Exact Valen candidate text; the released heads were trained on it.
-        return [("true", "True / 是：满足问题中的条件。"), ("false", "False / 否：不满足问题中的条件。")]
+        return [("true", "True"), ("false", "False")]
     if kind == "choice":
         if not isinstance(criteria, dict) or not 1 <= len(criteria) <= 255:
             raise ValueError("Choice needs 1-255 named criteria")
@@ -83,6 +100,58 @@ def target_distribution(target, keys):
     if not math.isclose(sum(values), 1.0, abs_tol=1e-6):
         raise ValueError("Target probabilities must sum to 1")
     return [float(v) for v in values]
+
+
+def resolve_dataset(spec):
+    """Local JSONL, a directory that contains one, a Hub id, or an alias (`valen`, `eval`, `smoke`)."""
+    if not spec:
+        raise ValueError("Dataset spec is empty")
+    spec = DATA_ALIASES.get(spec, spec)
+    path = Path(spec)
+    if path.is_file():
+        return path.resolve()
+    if path.is_dir():
+        for name in ("train.jsonl", "data.jsonl"):
+            if (path / name).is_file():
+                return (path / name).resolve()
+        jsonl = sorted(path.glob("*.jsonl"))
+        if len(jsonl) == 1:
+            return jsonl[0].resolve()
+        raise ValueError(f"{path}: need train.jsonl (or a single .jsonl)")
+    if "/" not in spec or spec.startswith(".") or "\\" in spec:
+        raise FileNotFoundError(spec)
+    from huggingface_hub import snapshot_download
+    dest = DATA_CACHE / spec.replace("/", "--")
+    dest.mkdir(parents=True, exist_ok=True)
+    print(f"Dataset {spec} → {dest}", flush=True)
+    snapshot_download(repo_id=spec, repo_type="dataset", local_dir=str(dest))
+    assets, archive = dest / "assets", dest / "assets.zip"
+    if archive.is_file() and not assets.is_dir():
+        print(f"Extracting {archive.name}", flush=True)
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(dest)
+    for name in ("train.jsonl", "test.jsonl", "val.jsonl"):
+        if (dest / name).is_file():
+            return (dest / name).resolve()
+    jsonl = sorted(p for p in dest.glob("*.jsonl") if p.name != "dataset_info.json")
+    if len(jsonl) == 1:
+        return jsonl[0].resolve()
+    raise FileNotFoundError(f"{spec}: no train.jsonl after download")
+
+
+def slice_records(records, mode, data_slice, jsonl_path):
+    """Valen's 100k recipe: SFT on the first 70k, RLCD on the last 30k. Other files are left whole."""
+    official = VALEN_TRAIN_HUB.replace("/", "--") in Path(jsonl_path).as_posix()
+    choice = data_slice
+    if choice == "auto":
+        choice = (mode if official else "all")
+    if choice == "all" or not official:
+        return records, choice
+    if choice == "sft":
+        return records[:VALEN_SFT_COUNT], choice
+    if choice == "rlcd":
+        return records[VALEN_SFT_COUNT:], choice
+    raise ValueError(f"Unknown data slice: {data_slice}")
 
 
 def read_jsonl(path):
@@ -709,8 +778,13 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--mode", choices=("sft", "rlcd"), required=True)
     p.add_argument("--base-model", default="Qwen/Qwen3.5-0.8B", help="HF id or local Qwen3.5 directory")
-    p.add_argument("--data", required=True, help="Valen JSONL; media paths are relative to its directory")
-    p.add_argument("--eval-data", help="Optional held-out Valen JSONL")
+    p.add_argument("--data", default=VALEN_TRAIN_HUB,
+                   help="Valen JSONL, directory, Hub id, or alias (valen/eval/smoke). "
+                        f"Default: {VALEN_TRAIN_HUB}")
+    p.add_argument("--eval-data", default=VALEN_EVAL_HUB,
+                   help=f"Held-out JSONL/Hub id/alias. Default: {VALEN_EVAL_HUB}. Pass empty to skip.")
+    p.add_argument("--data-slice", choices=("auto", "all", "sft", "rlcd"), default="auto",
+                   help="On the official 100k file: auto follows --mode (sft=first 70k, rlcd=last 30k)")
     p.add_argument("--output", required=True)
     p.add_argument("--init", help="Start a new run from a checkpoint directory (e.g. SFT -> RLCD)")
     p.add_argument("--resume", help="Continue a run (weights, optimizer, data cursor) from its checkpoint")
@@ -789,6 +863,8 @@ def parse_args(argv=None):
     if args.states_per_step < 1 or args.max_steps < 1:
         p.error("--states-per-step and --max-steps must be positive")
     args.head = dict(DEFAULT_HEAD) if args.head_type == "mixer" else {"head_type": "bilinear", "projection_dim": 256}
+    if args.eval_data in ("", "none", "off"):
+        args.eval_data = None
     return args
 
 
@@ -853,12 +929,17 @@ def main(argv=None):
             torch.cuda.set_rng_state_all(state["cuda_rng"])
         print(f"Resumed at step {progress['step']} (epoch {progress['epoch']}, cursor {progress['cursor']})", flush=True)
 
-    records = [r for r in read_jsonl(args.data) if is_labeled(r)]
+    args.data = str(resolve_dataset(args.data))
+    if args.eval_data:
+        args.eval_data = str(resolve_dataset(args.eval_data))
+    loaded = [r for r in read_jsonl(args.data) if is_labeled(r)]
+    records, used_slice = slice_records(loaded, args.mode, args.data_slice, args.data)
     eval_records = [r for r in read_jsonl(args.eval_data) if is_labeled(r)] if args.eval_data else None
     compiler = Compiler(processor, Path(args.data).parent, args.max_length, args.media_kwargs)
     eval_compiler = (Compiler(processor, Path(args.eval_data).parent, args.max_length, args.media_kwargs)
                      if args.eval_data else None)
-    print(f"{len(records)} labeled training records; mode={args.mode}; precision={args.precision}; "
+    print(f"{len(records)} labeled training records (slice={used_slice} of {len(loaded)}); "
+          f"data={args.data}; mode={args.mode}; precision={args.precision}; "
           f"optimizer={args.optim}; device={device}", flush=True)
 
     def epoch_order(epoch):
