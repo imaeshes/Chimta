@@ -1,19 +1,19 @@
 # Valen full fine-tuning (SFT + RLCD) on one 16 GB GPU
 
-Two scripts that train and run a Valen decision model, Qwen3.5-0.8B backbone plus decision head, on a single RTX 5070 Ti (16 GB):
+Two scripts that train and run a Valen decision model on a single RTX 5070 Ti (16 GB). Default architecture is **Valen-DE**: ModernBERT-base + DINOv3 ViT-B/16 + fusion/reader head (`--architecture dual_encoder`). `--architecture qwen` is the released Qwen3.5 mixer path.
 
-- `training.py` trains every weight (language model, vision tower and decision head) with `--mode sft` or `--mode rlcd`.
+- `training.py` trains with `--mode sft` or `--mode rlcd`.
 - `inference.py` runs a trained checkpoint on a JSONL file or on one question from the command line.
 
-The scripts don't depend on the `valen` package. They read the same JSONL format ([docs/data-format.md](../docs/data-format.md)) and copy Valen's prompt compiler and decision heads. The compiler output was checked token for token against `valen/data/compilers/qwen.py` on the smoke data.
+The scripts don't depend on the `valen` package. They read the same JSONL format ([docs/data-format.md](../docs/data-format.md)) and copy Valen's compilers and heads. Dual-encoder text padding is per mini-batch (`text_batch_size` 32), never to `state_max_length`. Video records are skipped on the dual-encoder path (one image max).
 
 How this differs from `python -m valen.train`:
 
 | | `valen.train` | `local_rlcd/training.py` |
 | --- | --- | --- |
-| Backbone update | LoRA on the language tower (plus merger / top vision blocks) | **Full fine-tuning** of all weights, or freeze parts with flags |
+| Backbone update | LoRA on Qwen, or dual-encoder stage unfreeze | Dual-encoder stages, or **full** Qwen fine-tuning |
 | Hardware | Multi-GPU data parallel | One GPU |
-| Checkpoint | Trainable deltas only; needs the base model | Full weights in `model.safetensors` (`backbone.*`, `head.*`) |
+| Checkpoint | Trainable deltas only; needs the base model | Full weights in `model.safetensors` |
 
 ## What "RLCD" means here
 
@@ -45,9 +45,14 @@ Optional speed-up: Qwen3.5 uses Gated DeltaNet layers. Without `flash-linear-att
 pip install flash-linear-attention causal-conv1d
 ```
 
-Download the base model (the script also accepts the Hub id directly):
+Default towers (Hub ids; first run downloads them):
 
 ```bash
+# Dual encoder (default --architecture dual_encoder)
+#   answerdotai/ModernBERT-base
+#   facebook/dinov3-vitb16-pretrain-lvd1689m
+
+# Optional Qwen path
 hf download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
 ```
 
@@ -74,31 +79,50 @@ You can still pass a local JSONL. Media paths are relative to that file. Only la
  "targets": {"color": {"probabilities": {"red": 0.0, "green": 1.0, "unknown": 0.0}}}}
 ```
 
-## Recommended recipe
+## Recommended recipe (ModernBERT + DINOv3)
 
-Run from the repository root. Each stage writes to its own output directory.
+Run from the repository root. Default `--architecture dual_encoder` matches `configs/train/dual_encoder_sft.json`: both towers frozen in `--stage warmup`, then unfreeze last 6 ModernBERT layers (`text` / `joint`) and last 2 DINOv3 blocks (`vision_top`). One combined backward per state.
 
 ```bash
-# 1. Head warmup: backbone frozen, head learns to read Qwen features (fast).
+# 1. Warmup SFT: frozen ModernBERT + DINO, train fusion/readers/head.
 #    Downloads General-100k + Eval-5k on first run (default --data / --eval-data).
-python local_rlcd/training.py --mode sft --freeze-backbone \
+python local_rlcd/training.py --mode sft --stage warmup \
+  --output output/local/de_sft_warmup --max-steps 300 --lr-head 2e-4 --sft-brier-weight 0.1
+
+# 2. Unfreeze top text layers (Valen `text` / `joint`).
+python local_rlcd/training.py --mode sft --stage text --init output/local/de_sft_warmup/latest \
+  --output output/local/de_sft_text --max-steps 2000 --epochs 3 --sft-brier-weight 0.1
+
+# 3. Unfreeze top vision blocks.
+python local_rlcd/training.py --mode sft --stage vision_top --init output/local/de_sft_text/best \
+  --output output/local/de_sft_vision --max-steps 1000 --sft-brier-weight 0.1
+
+# 4. RLCD from the SFT checkpoint (best/ = highest eval accuracy).
+python local_rlcd/training.py --mode rlcd --stage vision_top --init output/local/de_sft_vision/best \
+  --output output/local/de_rlcd --max-steps 1000 --group-size 8
+
+# Continue an interrupted run:
+python local_rlcd/training.py --mode rlcd --resume output/local/de_rlcd/latest \
+  --output output/local/de_rlcd --max-steps 1000
+
+# Local smoke:
+python local_rlcd/training.py --mode sft --data smoke --eval-data none --output output/local/smoke
+```
+
+`--text-model` defaults to `answerdotai/ModernBERT-base`. `--vision-model` defaults to `facebook/dinov3-vitb16-pretrain-lvd1689m`. Text sequences pad only to the longest item in that mini-batch of 32.
+
+### Qwen3.5 path
+
+```bash
+python local_rlcd/training.py --architecture qwen --mode sft --freeze-backbone \
   --base-model models/Qwen3.5-0.8B \
   --output output/local/sft_head --max-steps 300 --lr-head 2e-4
 
-# 2. Full SFT from the warm head (default: --device cuda --precision bf16).
-python local_rlcd/training.py --mode sft --init output/local/sft_head/latest \
+python local_rlcd/training.py --architecture qwen --mode sft --init output/local/sft_head/latest \
   --output output/local/sft_full --max-steps 2000 --epochs 3
 
-# 3. Full RLCD from the SFT checkpoint (best/ = highest eval accuracy).
-python local_rlcd/training.py --mode rlcd --init output/local/sft_full/best \
+python local_rlcd/training.py --architecture qwen --mode rlcd --init output/local/sft_full/best \
   --output output/local/rlcd_full --max-steps 1000
-
-# Continue an interrupted run (same flags, weights + optimizer + data cursor restored):
-python local_rlcd/training.py --mode rlcd --resume output/local/rlcd_full/latest \
-  --output output/local/rlcd_full --max-steps 1000
-
-# Local smoke instead of the 100k download:
-python local_rlcd/training.py --mode sft --data smoke --eval-data none --output output/local/smoke
 ```
 
 When `--init` or `--resume` is set, the base model and head architecture are read from the checkpoint. Valen's own experiments split the data, for example 70k SFT and 30k RLCD records out of 100k.
@@ -160,8 +184,8 @@ The default `--precision mixed` matches Valen's own setup: FP32 weights with BF1
 | Total before reference and activations | ~8.5 GB | ~6.8 GB |
 
 ```bash
-python local_rlcd/training.py --mode sft --precision bf16 --init output/local/head_warmup/latest \
-  --output output/local/sft_bf16
+python local_rlcd/training.py --mode sft --precision bf16 --init output/local/de_sft_warmup/latest \
+  --output output/local/de_sft_bf16
 ```
 
 - **Optimizer:** BF16 mode selects its own optimizer, `--optim adamw_bf16`, and refuses any other. At full-SFT learning rates (1e-5 to 1e-6), each step changes a weight by about 1e-5 of its value. That is smaller than BF16's spacing (about 4e-3 relative), so ordinary rounding drops every update. `adamw_bf16` computes each update in FP32, then writes it back with *stochastic rounding*. Rounding is unbiased, so small updates still add up correctly over many steps.
@@ -178,7 +202,7 @@ python local_rlcd/training.py --mode sft --precision bf16 --init output/local/he
 <output>/reference.safetensors  RLCD frozen reference policy (reused on --resume)
 ```
 
-`model.safetensors` uses the same `backbone.*` / `head.*` key names as Valen's merged releases. `--save-bf16` halves checkpoint size, but resumed runs then lose FP32 precision.
+Qwen checkpoints use `backbone.*` / `head.*`. Dual-encoder checkpoints use `text_encoder.*`, `vision_encoder.*`, fusion/reader keys, and `head.*`. `--save-bf16` halves checkpoint size, but resumed runs then lose FP32 precision.
 
 ## Inference
 

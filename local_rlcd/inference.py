@@ -15,8 +15,8 @@ import time
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from training import (MODEL_NAME, Compiler, answer, hard_correct, load_for_inference,  # noqa: E402
-                      read_jsonl, resolve_dataset, sft_loss)
+from training import (MODEL_NAME, answer, build_compiler, hard_correct, load_for_inference,  # noqa: E402
+                      question_logits, read_jsonl, resolve_dataset, sft_loss)
 
 
 def single_record(args):
@@ -39,8 +39,8 @@ def predict(model, compiler, record, temperature):
     started = time.perf_counter()
     state = compiler.compile(record)
     answers, labels = {}, {}
-    for question in state.questions:
-        logits = model(question).float()
+    for question, logits in question_logits(model, state):
+        logits = logits.float()
         answers[question.qid] = answer(question, logits, temperature)
         if question.target is not None:
             _, terms = sft_loss(logits, question.target)
@@ -80,7 +80,7 @@ def main():
         records, root = read_jsonl(args.data), Path(args.data).parent
     else:
         records, root = [single_record(args)], Path(".")
-    compiler = Compiler(processor, root, config["max_length"], config["media_kwargs"])
+    compiler = build_compiler(config, processor, root)
 
     out = Path(args.output).open("w", encoding="utf-8") if args.output else sys.stdout
     correct = hard = 0

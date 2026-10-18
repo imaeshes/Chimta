@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Single-GPU full fine-tuning of a Valen decision model: Qwen3.5 backbone + decision head.
+"""Single-GPU Valen training for a 16 GB GPU (RTX 5070 Ti).
+
+--architecture qwen            Qwen3.5 + mixer/bilinear head (released 0.8B/2B path)
+--architecture dual_encoder    ModernBERT + DINOv3 + fusion/reader (Valen-DE)
 
 Two objectives share one loop:
   --mode sft   distribution cross-entropy (+ optional Brier) on labeled candidates
-  --mode rlcd  Valen's RLCD: GRPO over the candidate distribution, rewarded for
-               correctness and calibrated confidence, with exact KL to a frozen
-               reference policy and a Brier auxiliary term (see valen/training/rlcd.py)
+  --mode rlcd  Valen's RLCD over the candidate softmax (see valen/training/rlcd.py)
 
-Unlike `python -m valen.train` (LoRA on the language tower), every backbone weight is
-trainable here unless frozen explicitly. Data is the Valen JSONL format (docs/data-format.md).
-The prompt compiler and decision heads reproduce valen/data/compilers/qwen.py and
-valen/modeling/qwen/heads.py so that readout positions match the released Valen models.
+Data is Valen JSONL (docs/data-format.md). Dual-encoder records may include one image,
+not video. Qwen records may include image and video.
 """
 import argparse
+from contextlib import nullcontext
 import copy
 from dataclasses import dataclass
 import hashlib
@@ -30,6 +30,7 @@ if os.name != "nt":
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 MODEL_NAME = "Valen-local"
 CONFIG_FILE = "valen_local.json"
@@ -61,6 +62,8 @@ DEFAULT_MEDIA_KWARGS = {
 }
 DEFAULT_HEAD = {"head_type": "mixer", "head_width": 256, "head_layers": 2,
                 "head_token_hidden_dim": 16, "head_channel_hidden_dim": 1024}
+DEFAULT_TEXT_ENCODER = "answerdotai/ModernBERT-base"
+DEFAULT_VISION_ENCODER = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 
 
 # --------------------------------------------------------------------------- data
@@ -324,6 +327,151 @@ class Compiler:
         return State(group_id, compiled, total)
 
 
+# ------------------------------------------------ dual-encoder compiler (ModernBERT + DINOv3)
+
+def parallel_candidates(question):
+    """Valen dual-encoder candidate text (valen/data/compilers/dual_encoder.py)."""
+    kind, criteria = question.get("type"), question.get("criteria")
+    if not isinstance(question.get("instructions"), str) or not question["instructions"].strip():
+        raise ValueError("instructions must be nonempty text")
+    if kind == "noul":
+        if criteria is None:
+            criteria = {"true": "The stated condition is true.", "false": "The stated condition is false."}
+        if not isinstance(criteria, dict) or set(criteria) != {"true", "false"}:
+            raise ValueError("Noul criteria must define true and false")
+        return [(k, criteria[k]) for k in ("true", "false")]
+    if kind == "choice":
+        if not isinstance(criteria, dict) or not 1 <= len(criteria) <= 255:
+            raise ValueError("Choice needs 1-255 named criteria")
+        result = [(k, (v if isinstance(v, str) and v.strip() else k)) for k, v in criteria.items()]
+    elif kind == "score":
+        if not isinstance(criteria, list) or not 2 <= len(criteria) <= 10:
+            raise ValueError("Score criteria must be an ordered list of 2-10 descriptions")
+        result = [(str(i), text) for i, text in enumerate(criteria)]
+    else:
+        raise ValueError(f"Unsupported question type: {kind}")
+    if any(not isinstance(k, str) or not k or not isinstance(v, str) or not v.strip() for k, v in result):
+        raise ValueError("Candidate names and descriptions must be nonempty strings")
+    return result
+
+
+@dataclass
+class ParallelState:
+    group_id: str
+    questions: list
+    state_tokens: list
+    instruction_tokens: list
+    candidate_tokens: list
+    candidate_offsets: list
+    pixel_values: torch.Tensor | None
+    visual_mask: torch.Tensor | None
+    tokens: int
+    media: list
+
+
+class ParallelCompiler:
+    """Independent state / instruction / candidate sequences. Pads only inside a text mini-batch."""
+
+    def __init__(self, tokenizer, image_processor, media_root=".", image_size=384, patch_size=16,
+                 state_max_length=1024, question_max_length=128, candidate_max_length=128, max_questions=256):
+        self.tokenizer, self.image_processor = tokenizer, image_processor
+        self.media_root = Path(media_root)
+        self.image_size, self.patch_size = image_size, patch_size
+        self.limits = (state_max_length, question_max_length, candidate_max_length)
+        self.max_questions = max_questions
+        if tokenizer.pad_token_id is None:
+            raise ValueError("Text encoder tokenizer needs a pad token")
+
+    def _tokens(self, text, limit, role):
+        ids = self.tokenizer.encode(text, add_special_tokens=True, truncation=False)
+        if not ids or len(ids) > limit:
+            raise ValueError(f"{role}: {len(ids)} tokens exceed budget={limit} or empty sequence; no truncation")
+        return ids
+
+    def _state(self, state):
+        messages = [{"role": "user", "content": state}] if isinstance(state, str) else state["messages"]
+        text, media = [], []
+        for message in messages:
+            if message["role"] not in {"user", "assistant", "system"}:
+                raise ValueError("Unsupported state role")
+            text.append(f"{message['role']}:\n")
+            content = message["content"]
+            content = [{"type": "text", "text": content}] if isinstance(content, str) else content
+            for item in content:
+                if item["type"] == "text":
+                    text.append(item["text"])
+                elif item["type"] == "image_url":
+                    url = item["image_url"]["url"]
+                    if "://" in url:
+                        raise ValueError("Media must be a local file path")
+                    path = Path(url)
+                    path = (path if path.is_absolute() else self.media_root / path).resolve(strict=True)
+                    media.append(str(path))
+                    text.append("\n[image]\n")
+                else:
+                    raise ValueError("Dual encoder supports text and a single image, not video")
+            text.append("\n")
+        if len(media) > 1:
+            raise ValueError("Dual encoder supports at most one image per state")
+        return "".join(text), media
+
+    def _image(self, path):
+        from PIL import Image, ImageOps
+        import numpy as np
+        with Image.open(path) as raw:
+            image = ImageOps.exif_transpose(raw).convert("RGB")
+            size, patch = self.image_size, self.patch_size
+            ratio = size / max(image.size)
+            width, height = max(1, round(image.width * ratio)), max(1, round(image.height * ratio))
+            image = image.resize((width, height), resample=self.image_processor.resample)
+            mean = np.array(self.image_processor.image_mean, dtype=np.float32)
+            std = np.array(self.image_processor.image_std, dtype=np.float32)
+            canvas = Image.new("RGB", (size, size), tuple(np.rint(mean * 255).astype(int)))
+            left, top = (size - width) // 2, (size - height) // 2
+            canvas.paste(image, (left, top))
+            pixels = (np.asarray(canvas, dtype=np.float32) / 255.0 - mean) / std
+        axis = torch.arange(size // patch) * patch
+        valid_x = (axis < left + width) & (axis + patch > left)
+        valid_y = (axis < top + height) & (axis + patch > top)
+        valid = torch.cat([torch.ones(1, dtype=torch.bool), (valid_y[:, None] & valid_x[None, :]).flatten()])
+        return torch.from_numpy(pixels.copy()).permute(2, 0, 1).unsqueeze(0), valid.unsqueeze(0)
+
+    def compile(self, record, rng=None, labeled_only=False):
+        items = record["request"]["questions"]
+        if not isinstance(items, dict) or not 1 <= len(items) <= self.max_questions:
+            raise ValueError(f"Expected 1-{self.max_questions} questions")
+        selected = []
+        for qid, question in items.items():
+            pairs = parallel_candidates(question)
+            target = (record.get("targets") or {}).get(qid)
+            if labeled_only and target_distribution(target, [k for k, _ in pairs]) is None:
+                continue
+            if rng is not None and question["type"] == "choice":
+                rng.shuffle(pairs)
+            selected.append((qid, question, pairs, target))
+        group_id = str(record.get("group_id", ""))
+        if not selected:
+            return ParallelState(group_id, [], [], [], [], [0], None, None, 0, [])
+        state_text, media = self._state(record["request"]["state"])
+        state_ids = self._tokens(state_text, self.limits[0], "state")
+        questions, instructions, candidates, offsets = [], [], [], [0]
+        for qid, q, pairs, target in selected:
+            keys = [k for k, _ in pairs]
+            instructions.append(self._tokens(q["instructions"], self.limits[1], "instructions"))
+            for key, value in pairs:
+                text = json.dumps({"name": key, "description": value}, ensure_ascii=False) if q["type"] == "choice" else value
+                candidates.append(self._tokens(text, self.limits[2], "candidate"))
+            offsets.append(len(candidates))
+            questions.append(Question(qid, q["type"], keys, [v for _, v in pairs], [],
+                                      target_distribution(target, keys)))
+        pixels, mask = self._image(media[0]) if media else (None, None)
+        tokens = len(state_ids) + sum(map(len, instructions)) + sum(map(len, candidates))
+        if mask is not None:
+            tokens += int(mask.numel())
+        return ParallelState(group_id, questions, state_ids, instructions, candidates, offsets,
+                             pixels, mask, tokens, media)
+
+
 # ------------------------------------------------------------------------ heads
 
 class BilinearHead(nn.Module):
@@ -398,6 +546,8 @@ def build_head(hidden_size, config):
 # ------------------------------------------------------------------------ model
 
 class ValenModel(nn.Module):
+    architecture = "qwen"
+
     def __init__(self, backbone, head, autocast_bf16=True):
         super().__init__()
         self.backbone = backbone
@@ -419,6 +569,341 @@ class ValenModel(nn.Module):
             # The head runs outside autocast and stays FP32.
             logits.append(self.head.score_features(self.head.extract_features(hidden, branch)))
         return torch.cat(logits)
+
+
+# -------------------------------------------- dual-encoder model (copied from valen/modeling/dual_encoder)
+
+class _Attention(nn.Module):
+    def __init__(self, width, heads):
+        super().__init__()
+        self.heads, self.head_width = heads, width // heads
+        self.q = nn.Linear(width, width)
+        self.k = nn.Linear(width, width)
+        self.v = nn.Linear(width, width)
+        self.out = nn.Linear(width, width)
+
+    def _split(self, x):
+        return x.reshape(x.shape[0], x.shape[1], self.heads, self.head_width).transpose(1, 2)
+
+    def project_memory(self, memory):
+        return self._split(self.k(memory)), self._split(self.v(memory))
+
+    def forward(self, query, memory=None, mask=None, kv=None):
+        k, v = self.project_memory(memory) if kv is None else kv
+        allowed = mask[:, None, None, :].bool() if mask is not None else None
+        x = F.scaled_dot_product_attention(self._split(self.q(query)), k, v, attn_mask=allowed, dropout_p=0.0)
+        return self.out(x.transpose(1, 2).reshape(query.shape))
+
+
+class _FFN(nn.Sequential):
+    def __init__(self, width, intermediate):
+        super().__init__(nn.Linear(width, intermediate), nn.GELU(), nn.Linear(intermediate, width))
+
+
+class _FusionBlock(nn.Module):
+    def __init__(self, width, heads, intermediate):
+        super().__init__()
+        self.norms = nn.ModuleList([nn.LayerNorm(width) for _ in range(2)])
+        self.attention = _Attention(width, heads)
+        self.ffn = _FFN(width, intermediate)
+
+    def forward(self, x, mask):
+        norm = self.norms[0](x)
+        x = x + self.attention(norm, norm, mask)
+        return x + self.ffn(self.norms[1](x))
+
+
+class _QuestionBlock(nn.Module):
+    def __init__(self, width, heads, intermediate):
+        super().__init__()
+        self.norms = nn.ModuleList([nn.LayerNorm(width) for _ in range(4)])
+        self.self_attention = _Attention(width, heads)
+        self.instructions = _Attention(width, heads)
+        self.memory = _Attention(width, heads)
+        self.ffn = _FFN(width, intermediate)
+
+    def forward(self, r, h, hmask, memory, mmask):
+        n = self.norms[0](r)
+        r = r + self.self_attention(n, n)
+        r = r + self.instructions(self.norms[1](r), h, hmask)
+        shape = r.shape
+        r = r + self.memory(self.norms[2](r).reshape(1, -1, shape[-1]), memory, mmask).reshape(shape)
+        return r + self.ffn(self.norms[3](r))
+
+
+class _CandidateBlock(nn.Module):
+    def __init__(self, width, heads, intermediate):
+        super().__init__()
+        self.norms = nn.ModuleList([nn.LayerNorm(width) for _ in range(3)])
+        self.question = _Attention(width, heads)
+        self.memory = _Attention(width, heads)
+        self.ffn = _FFN(width, intermediate)
+
+    def forward(self, u, r, owners, memory, mmask, chunk_size):
+        kv = self.memory.project_memory(memory)
+        chunks = []
+        for start in range(0, len(u), chunk_size):
+            x = u[start:start + chunk_size].unsqueeze(1)
+            evidence = r[owners[start:start + chunk_size]]
+            x = x + self.question(self.norms[0](x), evidence)
+            x = x + self.memory(self.norms[1](x).transpose(0, 1), mask=mmask, kv=kv).transpose(0, 1)
+            chunks.append((x + self.ffn(self.norms[2](x))).squeeze(1))
+        return torch.cat(chunks)
+
+
+def _positions(length, width, device):
+    pos = torch.arange(length, device=device).float()[:, None]
+    frequencies = torch.exp(torch.arange(0, width, 2, device=device).float() * (-math.log(10000.0) / width))
+    features = pos * frequencies[None, :]
+    return torch.stack((features.sin(), features.cos()), -1).flatten(-2)[:, :width]
+
+
+def _load_encoder(path, config, unused_prefixes=(), device="cpu", dtype=torch.float32):
+    from transformers import AutoModel
+    local = Path(path).exists()
+    device = torch.device(device)
+    kwargs = dict(config=config, local_files_only=local, dtype=dtype,
+                  attn_implementation="sdpa", output_loading_info=True, low_cpu_mem_usage=True)
+    if device.type == "cuda":
+        kwargs["device_map"] = {"": device.index if device.index is not None else 0}
+    encoder, info = AutoModel.from_pretrained(path, **kwargs)
+    unexpected = [k for k in info.get("unexpected_keys", []) if not k.startswith(unused_prefixes)]
+    if unexpected or any(info.get(k) for k in ("missing_keys", "mismatched_keys", "error_msgs")):
+        raise ValueError(f"Incomplete encoder load: {info}")
+    return encoder
+
+
+def _unfreeze_last(layers, norm, count, option):
+    if type(count) is not int or not 1 <= count <= len(layers):
+        raise ValueError(f"{option} out of range")
+    for layer in layers[-count:]:
+        layer.requires_grad_(True)
+    norm.requires_grad_(True)
+
+
+class ValenDualEncoder(nn.Module):
+    """valen/modeling/dual_encoder/model.py — shared state memory, question/candidate readers."""
+
+    architecture = "dual_encoder"
+    model_name = "Valen-DE-ModernBERTbase-DINOv3B16-en-v1"
+
+    def __init__(self, text_encoder, vision_encoder, config):
+        super().__init__()
+        self.config = dict(config)
+        self.text_encoder, self.vision_encoder = text_encoder, vision_encoder
+        d, heads, inner = config.get("hidden_size", 512), config.get("num_heads", 8), config.get("intermediate_size", 2048)
+        self.width = d
+        self.pad_token_id = text_encoder.config.pad_token_id
+        self.text_projection = nn.Linear(text_encoder.config.hidden_size, d)
+        self.vision_projection = nn.Linear(vision_encoder.config.hidden_size, d)
+        self.modality = nn.Embedding(2, d)
+        self.coordinates = nn.Linear(2, d)
+        self.visual_cls = nn.Parameter(torch.zeros(1, 1, d))
+        self.fusion = nn.ModuleList([_FusionBlock(d, heads, inner) for _ in range(config.get("fusion_layers", 2))])
+        self.question_queries = nn.Parameter(torch.randn(1, config.get("question_queries", 8), d) / math.sqrt(d))
+        self.question_pool = _Attention(d, heads)
+        self.question_reader = nn.ModuleList([_QuestionBlock(d, heads, inner) for _ in range(config.get("question_layers", 3))])
+        self.candidate_query = nn.Parameter(torch.randn(1, 1, d) / math.sqrt(d))
+        self.candidate_pool = _Attention(d, heads)
+        self.task_type = nn.Embedding(3, d)
+        self.candidate_init = nn.Sequential(nn.Linear(3 * d, d), nn.GELU(), nn.Linear(d, d))
+        self.candidate_reader = nn.ModuleList([_CandidateBlock(d, heads, inner) for _ in range(config.get("candidate_layers", 2))])
+        self.head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 1)).float()
+        self.text_batch_size = config.get("text_batch_size", 32)
+        self.candidate_chunk_size = config.get("candidate_chunk_size", 256)
+
+    @property
+    def device(self):
+        return next(self.head.parameters()).device
+
+    def _amp(self):
+        return (torch.autocast("cuda", dtype=torch.bfloat16)
+                if self.device.type == "cuda" and self.config.get("dtype", "bf16") == "bf16" else nullcontext())
+
+    def _text_batch(self, sequences):
+        # Pad to the longest sequence in this mini-batch only, not to state_max_length.
+        device = self.device
+        length = max(map(len, sequences))
+        ids = torch.full((len(sequences), length), self.pad_token_id, dtype=torch.long, device=device)
+        mask = torch.zeros_like(ids, dtype=torch.bool)
+        for i, seq in enumerate(sequences):
+            ids[i, :len(seq)] = torch.tensor(seq, device=device)
+            mask[i, :len(seq)] = True
+        context = nullcontext() if any(p.requires_grad for p in self.text_encoder.parameters()) else torch.no_grad()
+        with context:
+            hidden = self.text_encoder(input_ids=ids, attention_mask=mask, return_dict=True).last_hidden_state
+        return self.text_projection(hidden), mask
+
+    def _text_chunks(self, sequences, pool=None):
+        order = sorted(range(len(sequences)), key=lambda i: len(sequences[i]))
+        results = [None] * len(sequences)
+        for start in range(0, len(order), self.text_batch_size):
+            indices = order[start:start + self.text_batch_size]
+            hidden, mask = self._text_batch([sequences[i] for i in indices])
+            if pool is not None:
+                hidden = pool(self.candidate_query.expand(len(indices), -1, -1), hidden, mask).squeeze(1)
+            for row, i in enumerate(indices):
+                results[i] = hidden[row] if pool is not None else hidden[row, :len(sequences[i])]
+        if pool is not None:
+            return torch.stack(results)
+        max_length = max(map(len, sequences))
+        hidden = torch.stack([F.pad(h, (0, 0, 0, max_length - h.shape[0])) for h in results])
+        mask = torch.arange(max_length, device=hidden.device)[None, :] < torch.tensor(
+            list(map(len, sequences)), device=hidden.device)[:, None]
+        return hidden, mask
+
+    def encode_state(self, state):
+        with self._amp():
+            text, mask = self._text_batch([state.state_tokens])
+            text = text + self.modality.weight[0] + _positions(text.shape[1], self.width, text.device)
+            if state.pixel_values is not None:
+                pixels = state.pixel_values.to(device=text.device, dtype=next(self.vision_encoder.parameters()).dtype)
+                context = nullcontext() if any(p.requires_grad for p in self.vision_encoder.parameters()) else torch.no_grad()
+                with context:
+                    hidden = self.vision_encoder(pixel_values=pixels, return_dict=True).last_hidden_state
+                registers = getattr(self.vision_encoder.config, "num_register_tokens", 0) or 0
+                hidden = torch.cat((hidden[:, :1], hidden[:, 1 + registers:]), dim=1)
+                vision = self.vision_projection(hidden)
+                patch = self.vision_encoder.config.patch_size
+                rows, cols = pixels.shape[-2] // patch, pixels.shape[-1] // patch
+                if vision.shape[1] != rows * cols + 1:
+                    raise ValueError("Unexpected vision token layout")
+                y, x = torch.meshgrid(torch.linspace(-1, 1, rows, device=text.device),
+                                      torch.linspace(-1, 1, cols, device=text.device), indexing="ij")
+                xy = self.coordinates(torch.stack((x, y), -1).reshape(1, -1, 2))
+                vision = vision + torch.cat((self.visual_cls, xy), 1) + self.modality.weight[1]
+                text = torch.cat((text, vision), dim=1)
+                mask = torch.cat((mask, state.visual_mask.to(text.device)), dim=1)
+            for layer in self.fusion:
+                text = layer(text, mask)
+            return text, mask
+
+    def encode_questions(self, state, memory):
+        with self._amp():
+            m, mmask = memory
+            h, hmask = self._text_chunks(state.instruction_tokens)
+            r = self.question_pool(self.question_queries.expand(len(state.questions), -1, -1), h, hmask)
+            for layer in self.question_reader:
+                r = layer(r, h, hmask, m, mmask)
+            return r
+
+    def score_questions(self, state, memory, evidence):
+        with self._amp():
+            m, mmask = memory
+            candidates = self._text_chunks(state.candidate_tokens, self.candidate_pool)
+            counts = torch.tensor([b - a for a, b in zip(state.candidate_offsets, state.candidate_offsets[1:])],
+                                  device=m.device)
+            owners = torch.arange(len(counts), device=m.device).repeat_interleave(counts)
+            kinds = torch.tensor([{"choice": 0, "noul": 1, "score": 2}[q.kind] for q in state.questions], device=m.device)
+            u = self.candidate_init(torch.cat((candidates, evidence.mean(1)[owners], self.task_type(kinds)[owners]), -1))
+            for layer in self.candidate_reader:
+                u = layer(u, evidence, owners, m, mmask, self.candidate_chunk_size)
+        with torch.autocast(device_type=u.device.type, enabled=False):
+            logits = self.head(u.float()).squeeze(-1)
+        return list(logits.split(counts.tolist()))
+
+    def forward(self, state):
+        if not state.questions:
+            return []
+        memory = self.encode_state(state)
+        return self.score_questions(state, memory, self.encode_questions(state, memory))
+
+    forward_state = forward
+
+
+class DualProcessor:
+    """ModernBERT tokenizer + DINOv3 image processor, saved beside model.safetensors."""
+
+    def __init__(self, tokenizer, image_processor):
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+
+    def save_pretrained(self, directory):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        self.tokenizer.save_pretrained(directory)
+        self.image_processor.save_pretrained(directory)
+
+
+def is_dual(model):
+    return getattr(model, "architecture", "qwen") == "dual_encoder"
+
+
+def question_logits(model, state):
+    """Pairs (question, logits[K]). Dual encoder: one shared forward. Qwen: one forward per question."""
+    if is_dual(model):
+        return list(zip(state.questions, model(state)))
+    return [(question, model(question)) for question in state.questions]
+
+
+def build_dual_encoder(args, device):
+    from transformers import AutoConfig, AutoImageProcessor, AutoTokenizer
+    device = torch.device(device)
+    text_path, vision_path = args.text_model, args.vision_model
+    text_cfg = AutoConfig.from_pretrained(text_path, local_files_only=Path(text_path).exists())
+    if text_cfg.model_type != "modernbert":
+        raise ValueError("Dual encoder text tower must be ModernBERT")
+    for name in ("attention_dropout", "embedding_dropout", "mlp_dropout", "classifier_dropout"):
+        setattr(text_cfg, name, 0.0)
+    vision_cfg = AutoConfig.from_pretrained(vision_path, local_files_only=Path(vision_path).exists())
+    if vision_cfg.model_type != "dinov3_vit":
+        raise ValueError("Dual encoder vision tower must be DINOv3 ViT")
+    for name in ("pos_embed_shift", "pos_embed_jitter", "pos_embed_rescale"):
+        setattr(vision_cfg, name, None)
+    vision_cfg.attention_dropout = vision_cfg.drop_path_rate = 0.0
+    load_dtype = torch.bfloat16 if args.precision == "bf16" else torch.float32
+    text = _load_encoder(text_path, text_cfg, ("head.", "decoder."), device, load_dtype)
+    vision = _load_encoder(vision_path, vision_cfg, (), device, load_dtype)
+    de_config = {
+        "dtype": "bf16",
+        "hidden_size": args.de_hidden, "num_heads": args.de_heads, "intermediate_size": args.de_intermediate,
+        "fusion_layers": 2, "question_layers": 3, "candidate_layers": 2, "question_queries": 8,
+        "text_batch_size": 32, "candidate_chunk_size": 256,
+    }
+    model = ValenDualEncoder(text, vision, de_config)
+    apply_dual_stage(model, args.stage, args.text_unfreeze_layers, args.vision_unfreeze_layers,
+                     args.no_gradient_checkpointing)
+    tokenizer = AutoTokenizer.from_pretrained(text_path, local_files_only=Path(text_path).exists())
+    image_processor = AutoImageProcessor.from_pretrained(vision_path, local_files_only=Path(vision_path).exists())
+    model = model.to(device)
+    if args.precision == "bf16":
+        model.to(dtype=torch.bfloat16)
+    model.head.float()
+    disable_dropout(model)
+    return model, DualProcessor(tokenizer, image_processor)
+
+
+def build_compiler(config, processor, media_root):
+    args = config.get("args") or {}
+    if config.get("architecture", args.get("architecture", "qwen")) == "dual_encoder":
+        from transformers import AutoConfig
+        vision = config.get("vision_model") or args.get("vision_model") or DEFAULT_VISION_ENCODER
+        local = Path(str(vision)).exists()
+        patch = AutoConfig.from_pretrained(vision, local_files_only=local).patch_size
+        return ParallelCompiler(
+            processor.tokenizer, processor.image_processor, media_root,
+            image_size=int(args.get("image_size", 384)), patch_size=patch,
+            state_max_length=int(args.get("state_max_length", 1024)),
+            question_max_length=int(args.get("question_max_length", 128)),
+            candidate_max_length=int(args.get("candidate_max_length", 128)),
+            max_questions=int(args.get("max_questions", 256)))
+    return Compiler(processor, media_root, config.get("max_length", 8192), config.get("media_kwargs"))
+
+
+def apply_dual_stage(model, stage, text_layers, vision_layers, no_checkpointing):
+    model.text_encoder.requires_grad_(False)
+    model.vision_encoder.requires_grad_(False)
+    if stage not in {"warmup", "text", "joint", "vision_top"}:
+        raise ValueError(f"Unknown dual-encoder stage: {stage}")
+    if stage != "warmup":
+        _unfreeze_last(model.text_encoder.layers, model.text_encoder.final_norm, text_layers, "text_unfreeze_layers")
+    if stage == "vision_top":
+        _unfreeze_last(model.vision_encoder.model.layer, model.vision_encoder.norm, vision_layers,
+                       "vision_unfreeze_layers")
+    if not no_checkpointing:
+        for encoder in (model.text_encoder, model.vision_encoder):
+            if any(p.requires_grad for p in encoder.parameters()):
+                encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
 
 def load_backbone(model_path, attn_implementation="eager", dtype=torch.float32, device="cpu"):
@@ -451,10 +936,14 @@ def disable_dropout(module):
 def save_weights(model, path, backbone_dtype=torch.float32):
     from safetensors.torch import save_file
     tensors = {}
+    encoder_prefix = ("backbone.", "text_encoder.", "vision_encoder.")
     for name, value in model.state_dict().items():
         value = value.detach()
-        if name.startswith("backbone.") and value.is_floating_point():
-            value = value.to(backbone_dtype)
+        if value.is_floating_point():
+            if name.startswith("head."):
+                value = value.float()
+            elif name.startswith(encoder_prefix) or (is_dual(model) and name != "head"):
+                value = value.to(backbone_dtype)
         tensors[name] = value.cpu().contiguous()
     tmp = Path(str(path) + ".tmp")
     save_file(tensors, str(tmp))
@@ -485,11 +974,32 @@ def load_for_inference(checkpoint, device="cuda", base_model=None, attn="eager")
     from transformers import AutoProcessor
     checkpoint = Path(checkpoint)
     config = json.loads((checkpoint / CONFIG_FILE).read_text(encoding="utf-8"))
-    processor = AutoProcessor.from_pretrained(checkpoint)
     target = torch.device(device)
-    dtype = torch.bfloat16 if target.type == "cuda" else torch.float32
-    model = build_model(base_model or config["base_model"], config["head"], target, attn,
-                        gradient_checkpointing=False, backbone_dtype=dtype)
+    saved = config.get("args") or {}
+    architecture = config.get("architecture", saved.get("architecture", "qwen"))
+    if architecture == "dual_encoder":
+        args = argparse.Namespace(
+            text_model=base_model or config.get("text_model") or saved.get("text_model") or DEFAULT_TEXT_ENCODER,
+            vision_model=config.get("vision_model") or saved.get("vision_model") or DEFAULT_VISION_ENCODER,
+            precision="bf16" if target.type == "cuda" else "mixed",
+            de_hidden=int(saved.get("de_hidden", 512)),
+            de_heads=int(saved.get("de_heads", 8)),
+            de_intermediate=int(saved.get("de_intermediate", 2048)),
+            stage="warmup",
+            text_unfreeze_layers=int(saved.get("text_unfreeze_layers", 6)),
+            vision_unfreeze_layers=int(saved.get("vision_unfreeze_layers", 2)),
+            no_gradient_checkpointing=True,
+        )
+        model, processor = build_dual_encoder(args, target)
+        if (checkpoint / "tokenizer.json").exists() or (checkpoint / "tokenizer_config.json").exists():
+            from transformers import AutoImageProcessor, AutoTokenizer
+            processor = DualProcessor(AutoTokenizer.from_pretrained(checkpoint),
+                                      AutoImageProcessor.from_pretrained(checkpoint))
+    else:
+        processor = AutoProcessor.from_pretrained(checkpoint)
+        dtype = torch.bfloat16 if target.type == "cuda" else torch.float32
+        model = build_model(base_model or config["base_model"], config["head"], target, attn,
+                            gradient_checkpointing=False, backbone_dtype=dtype)
     load_weights(model, checkpoint / WEIGHTS_FILE)
     model.head.float()
     return model.eval(), processor, config
@@ -558,8 +1068,10 @@ def rlcd_rollouts(model, reference, states, args):
     result = []
     for state in states:
         group = []
-        for question in state.questions:
-            logits = model(question).float()
+        pairs = question_logits(model, state)
+        refs = question_logits(reference, state) if reference is not None else [(None, None)] * len(pairs)
+        for (question, logits), (_, ref_logits) in zip(pairs, refs):
+            logits = logits.float()
             if not torch.isfinite(logits).all():
                 raise ValueError(f"Non-finite logits for {state.group_id}/{question.qid}")
             log_probs = logits.log_softmax(-1)
@@ -567,9 +1079,7 @@ def rlcd_rollouts(model, reference, states, args):
             actions = torch.multinomial(log_probs.exp(), args.group_size, replacement=True)
             reward, correctness, confidence, _ = decision_reward(
                 log_probs.exp(), target, actions, args.correctness_weight, args.confidence_weight)
-            ref = None
-            if reference is not None:
-                ref = reference(question).float().log_softmax(-1).to(logits.device)
+            ref = None if ref_logits is None else ref_logits.float().log_softmax(-1).to(logits.device)
             group.append(Rollout(actions, log_probs[actions], group_advantages(reward, args.advantage_epsilon),
                                  reward, correctness, confidence, ref))
         result.append(group)
@@ -609,8 +1119,8 @@ def evaluate(model, compiler, records, limit=None):
         except (ValueError, FileNotFoundError) as exc:
             print(f"[eval] skip {record.get('group_id')}: {exc}", flush=True)
             continue
-        for question in state.questions:
-            logits = model(question).float()
+        for question, logits in question_logits(model, state):
+            logits = logits.float()
             _, terms = sft_loss(logits, question.target)
             totals["questions"] += 1
             totals["ce"] += float(terms["ce"])
@@ -627,6 +1137,12 @@ def evaluate(model, compiler, records, limit=None):
 # --------------------------------------------------------------------- training
 
 def configure_trainable(model, args):
+    if is_dual(model):
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"Trainable parameters: {trainable:,} / {total:,} ({100 * trainable / max(total, 1):.1f}%)  "
+              f"stage={args.stage}", flush=True)
+        return
     model.requires_grad_(True)
     if args.freeze_backbone:
         model.backbone.requires_grad_(False)
@@ -709,8 +1225,19 @@ def make_optimizer(model, args):
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        part = ("head" if name.startswith("head.") else "merger" if ".visual.merger." in name
-                else "vision" if ".visual." in name else "language")
+        if name.startswith(("head.", "fusion", "question_", "candidate_", "task_type", "modality",
+                            "coordinates", "visual_cls", "text_projection", "vision_projection")):
+            part = "head"
+        elif name.startswith("text_encoder."):
+            part = "language"
+        elif name.startswith("vision_encoder.") or (".visual." in name and ".visual.merger." not in name):
+            part = "vision"
+        elif ".visual.merger." in name:
+            part = "merger"
+        elif name.startswith("head."):
+            part = "head"
+        else:
+            part = "language"
         decay = parameter.ndim >= 2 and "embed" not in name and "norm" not in name
         groups.setdefault((part, decay), []).append(parameter)
     params = [{"params": ps, "lr": rates[part], "base_lr": rates[part],
@@ -746,12 +1273,17 @@ def make_reference(model, device, path):
     """Frozen copy of the starting policy; BF16 on CUDA to save memory."""
     reference = copy.deepcopy(model)
     reference.requires_grad_(False)
-    reference.backbone.gradient_checkpointing_disable()
+    if is_dual(reference):
+        for encoder in (reference.text_encoder, reference.vision_encoder):
+            if hasattr(encoder, "gradient_checkpointing_disable"):
+                encoder.gradient_checkpointing_disable()
+    else:
+        reference.backbone.gradient_checkpointing_disable()
     if path.exists():
         load_weights(reference, path)
     else:
         save_weights(model, path, backbone_dtype=torch.bfloat16)
-    if torch.device(device).type == "cuda":
+    if torch.device(device).type == "cuda" and not is_dual(reference):
         reference.backbone.to(torch.bfloat16)
     reference.head.float()
     return reference.to(device).eval()
@@ -761,8 +1293,10 @@ def save_checkpoint(directory, model, optimizer, processor, args, progress):
     directory.mkdir(parents=True, exist_ok=True)
     bf16 = args.save_bf16 or args.precision == "bf16"  # BF16 weights are saved exactly.
     save_weights(model, directory / WEIGHTS_FILE, torch.bfloat16 if bf16 else torch.float32)
-    config = {"model": MODEL_NAME, "base_model": args.base_model, "head": args.head,
-              "max_length": args.max_length, "media_kwargs": args.media_kwargs,
+    config = {"model": getattr(model, "model_name", MODEL_NAME),
+              "architecture": "dual_encoder" if is_dual(model) else "qwen",
+              "base_model": args.base_model, "text_model": args.text_model, "vision_model": args.vision_model,
+              "head": args.head, "max_length": args.max_length, "media_kwargs": args.media_kwargs,
               "mode": args.mode, "progress": progress, "args": vars(args)}
     (directory / CONFIG_FILE).write_text(json.dumps(config, indent=2, default=str), encoding="utf-8")
     processor.save_pretrained(directory)
@@ -777,7 +1311,23 @@ def save_checkpoint(directory, model, optimizer, processor, args, progress):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--mode", choices=("sft", "rlcd"), required=True)
+    p.add_argument("--architecture", choices=("qwen", "dual_encoder"), default="dual_encoder",
+                   help="dual_encoder: ModernBERT + DINOv3 (Valen-DE). qwen: Qwen3.5 + mixer/bilinear head")
     p.add_argument("--base-model", default="Qwen/Qwen3.5-0.8B", help="HF id or local Qwen3.5 directory")
+    p.add_argument("--text-model", default=DEFAULT_TEXT_ENCODER, help="ModernBERT id or local directory")
+    p.add_argument("--vision-model", default=DEFAULT_VISION_ENCODER, help="DINOv3 ViT id or local directory")
+    p.add_argument("--stage", choices=("warmup", "text", "joint", "vision_top"), default="warmup",
+                   help="Dual-encoder freeze schedule: warmup freezes both towers")
+    p.add_argument("--text-unfreeze-layers", type=int, default=6)
+    p.add_argument("--vision-unfreeze-layers", type=int, default=2)
+    p.add_argument("--de-hidden", type=int, default=512)
+    p.add_argument("--de-heads", type=int, default=8)
+    p.add_argument("--de-intermediate", type=int, default=2048)
+    p.add_argument("--image-size", type=int, default=384)
+    p.add_argument("--state-max-length", type=int, default=1024)
+    p.add_argument("--question-max-length", type=int, default=128)
+    p.add_argument("--candidate-max-length", type=int, default=128)
+    p.add_argument("--max-questions", type=int, default=256)
     p.add_argument("--data", default=VALEN_TRAIN_HUB,
                    help="Valen JSONL, directory, Hub id, or alias (valen/eval/smoke). "
                         f"Default: {VALEN_TRAIN_HUB}")
@@ -890,20 +1440,40 @@ def main(argv=None):
     source = Path(args.resume or args.init) if (args.resume or args.init) else None
     if source is not None:
         saved = json.loads((source / CONFIG_FILE).read_text(encoding="utf-8"))
-        if saved["base_model"] != args.base_model:
+        saved_args = saved.get("args") or {}
+        saved_arch = saved.get("architecture", saved_args.get("architecture", "qwen"))
+        if saved_arch != args.architecture:
+            sys.exit(f"Checkpoint architecture is {saved_arch!r}; pass --architecture {saved_arch}")
+        if saved.get("base_model") and saved["base_model"] != args.base_model:
             print(f"Using checkpoint base model {saved['base_model']!r}", flush=True)
             args.base_model = saved["base_model"]
-        args.head = saved["head"]
-        saved_precision = saved.get("args", {}).get("precision", "mixed")
+        for key in ("text_model", "vision_model", "de_hidden", "de_heads", "de_intermediate"):
+            if saved.get(key) is not None:
+                setattr(args, key, saved[key])
+            elif saved_args.get(key) is not None:
+                setattr(args, key, saved_args[key])
+        if "head" in saved:
+            args.head = saved["head"]
+        if args.resume:
+            for key in ("stage", "text_unfreeze_layers", "vision_unfreeze_layers"):
+                if saved_args.get(key) is not None:
+                    setattr(args, key, saved_args[key])
+        saved_precision = saved_args.get("precision", "mixed")
         if args.resume and saved_precision != args.precision:
             sys.exit(f"Checkpoint was trained with --precision {saved_precision}; resume with the same "
                      "value, or start a new run with --init")
 
-    processor = AutoProcessor.from_pretrained(args.base_model)
-    backbone_dtype = torch.bfloat16 if args.precision == "bf16" else torch.float32
-    model = build_model(args.base_model, args.head, device, args.attn, not args.no_gradient_checkpointing,
-                        backbone_dtype)
-    model.head.float()
+    if args.architecture == "dual_encoder":
+        model, processor = build_dual_encoder(args, device)
+        print(f"architecture=dual_encoder  text={args.text_model}  vision={args.vision_model}  "
+              f"stage={args.stage}", flush=True)
+    else:
+        processor = AutoProcessor.from_pretrained(args.base_model)
+        backbone_dtype = torch.bfloat16 if args.precision == "bf16" else torch.float32
+        model = build_model(args.base_model, args.head, device, args.attn, not args.no_gradient_checkpointing,
+                            backbone_dtype)
+        model.head.float()
+        print(f"architecture=qwen  base={args.base_model}", flush=True)
     if source is not None:
         load_weights(model, source / WEIGHTS_FILE)
         print(f"Loaded weights from {source}", flush=True)
@@ -935,11 +1505,14 @@ def main(argv=None):
     loaded = [r for r in read_jsonl(args.data) if is_labeled(r)]
     records, used_slice = slice_records(loaded, args.mode, args.data_slice, args.data)
     eval_records = [r for r in read_jsonl(args.eval_data) if is_labeled(r)] if args.eval_data else None
-    compiler = Compiler(processor, Path(args.data).parent, args.max_length, args.media_kwargs)
-    eval_compiler = (Compiler(processor, Path(args.eval_data).parent, args.max_length, args.media_kwargs)
+    compiler_config = {"architecture": args.architecture, "max_length": args.max_length,
+                       "media_kwargs": args.media_kwargs, "args": vars(args),
+                       "vision_model": args.vision_model}
+    compiler = build_compiler(compiler_config, processor, Path(args.data).parent)
+    eval_compiler = (build_compiler(compiler_config, processor, Path(args.eval_data).parent)
                      if args.eval_data else None)
     print(f"{len(records)} labeled training records (slice={used_slice} of {len(loaded)}); "
-          f"data={args.data}; mode={args.mode}; precision={args.precision}; "
+          f"data={args.data}; architecture={args.architecture}; mode={args.mode}; precision={args.precision}; "
           f"optimizer={args.optim}; device={device}", flush=True)
 
     def epoch_order(epoch):
@@ -996,14 +1569,20 @@ def main(argv=None):
         if args.mode == "sft":
             optimizer.zero_grad(set_to_none=True)
             for state in batch:
-                for question in state.questions:
-                    logits = model(question)
+                losses = []
+                for question, logits in question_logits(model, state):
                     loss, terms = sft_loss(logits, question.target, args.sft_brier_weight)
-                    backward_question(loss, len(state.questions), len(batch))
                     accumulate(terms | {"loss": loss.detach()})
                     c = hard_correct(logits.detach(), question.target)
                     if c is not None:
                         hard, correct = hard + 1, correct + c
+                    if is_dual(model):
+                        losses.append(loss)
+                    else:
+                        backward_question(loss, len(state.questions), len(batch))
+                if is_dual(model):
+                    combined = losses[0] if len(losses) == 1 else torch.stack(losses).sum()
+                    backward_question(combined, len(state.questions), len(batch))
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
             optimizer.step()
             progress["optimizer_steps"] += 1
@@ -1012,14 +1591,20 @@ def main(argv=None):
             for _ in range(args.num_iterations):
                 optimizer.zero_grad(set_to_none=True)
                 for state, group in zip(batch, rollouts):
-                    for question, rollout in zip(state.questions, group):
-                        logits = model(question)
+                    losses = []
+                    for (question, logits), rollout in zip(question_logits(model, state), group):
                         loss, terms = rlcd_loss(logits, question, rollout, args)
-                        backward_question(loss, len(state.questions), len(batch))
                         accumulate(terms | {"loss": loss.detach()})
                         c = hard_correct(logits.detach(), question.target)
                         if c is not None:
                             hard, correct = hard + 1, correct + c
+                        if is_dual(model):
+                            losses.append(loss)
+                        else:
+                            backward_question(loss, len(state.questions), len(batch))
+                    if is_dual(model):
+                        combined = losses[0] if len(losses) == 1 else torch.stack(losses).sum()
+                        backward_question(combined, len(state.questions), len(batch))
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
                 optimizer.step()
                 progress["optimizer_steps"] += 1
